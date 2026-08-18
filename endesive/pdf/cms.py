@@ -1,21 +1,20 @@
 #!/usr/bin/env vpython3
-import sys
-import time
-import random
-import io
-import struct
-import datetime
-import hashlib
 import codecs
+import hashlib
+import io
+import random
 import struct
-from cryptography.hazmat import backends
+import time
+
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509 import ObjectIdentifier
-from endesive import signer
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader, PdfWriter, PasswordType
 from pypdf import generic as po
+from pypdf._encryption import Encryption
+
+from endesive import signer
+
 
 def b_(s):
     """Encode str to bytes (pass bytes through unchanged).
@@ -70,37 +69,53 @@ class WNumberObject(po.NumberObject):
         stream.write(self.Format % self)
 
 
+class PDFWrongPasswordError(ValueError):
+    """Raised when the password given for an encrypted PDF does not
+    match the document's stored user/owner password verifier.
+
+    Deliberately a real, always-checked ``raise`` rather than an
+    ``assert``: ``assert`` statements are compiled out entirely when
+    Python runs with the ``-O``/``-OO`` optimization flags, which would
+    silently disable this check and let signing proceed with a bogus
+    encryption key.
+    """
+
+
 class SignedData(PdfWriter):
     def encrypt(self, prev, password, rc):
-        encrypt = prev.trailer["/Encrypt"].get_object()
-        if encrypt["/V"] == 2:
-            rev = 3
-            keylen = 128 // 8
-        else:
-            rev = 2
-            keylen = 40 // 8
-        P = encrypt["/P"].getObject()
-        O = encrypt["/O"].getObject()
-        ID_1 = prev.trailer["/ID"].getObject()[0]
-        real_U = encrypt["/U"].getObject().original_bytes
-        if rev == 2:
-            U, key = pdf._alg34(password, O, P, ID_1)
-        else:
-            assert rev == 3
-            U, key = pdf._alg35(
-                password,
-                rev,
-                keylen,
-                O,
-                P,
-                ID_1,
-                encrypt.get("/EncryptMetadata", pdf.BooleanObject(False)).getObject(),
+        encrypt_dict = prev.trailer["/Encrypt"].get_object()
+        ID_1 = prev.trailer["/ID"].get_object()[0].original_bytes
+
+        if isinstance(password, str):
+            try:
+                pwd = password.encode("latin-1")
+            except Exception:
+                pwd = password.encode("utf-8")  # Fallback logic for wider unicode support
+
+        enc = Encryption.read(encrypt_dict, ID_1)
+        if enc.verify(pwd) == PasswordType.NOT_DECRYPTED:
+            raise PDFWrongPasswordError(
+                "wrong password for /V %s encrypted document" % enc.V
             )
-            U, real_U = U[:16], real_U[:16]
-        assert U == real_U
-        self._encrypt_key = key
+        self._encryption = enc
 
     def write(self, stream, prev, startdata):
+        if getattr(self, "native_incremental", False):
+            if prev.is_encrypted:
+                # pypdf's own _write_increment() has its per-object
+                # encryption call commented out upstream ("encryption is
+                # not operational"), so it cannot produce a valid
+                # encrypted incremental update. Fall back is not
+                # attempted automatically: fail loudly instead of
+                # silently writing an unencrypted/corrupt file.
+                raise NotImplementedError(
+                    "native_incremental=True does not support encrypted "
+                    "documents (pypdf's incremental writer does not "
+                    "encrypt objects); sign without native_incremental "
+                    "for encrypted PDFs."
+                )
+            return self._write_native_incremental(stream, prev, startdata)
+
         stream.write(b_("\r\n"))
         positions = {}
         for i in range(len(self._objects)):
@@ -111,14 +126,8 @@ class SignedData(PdfWriter):
                 continue
             positions[idnum] = startdata + stream.tell()
             stream.write(b_(str(idnum) + " 0 obj\n"))
-            key = None
-            if self._encrypt_key is not None:
-                pack1 = struct.pack("<i", i + 1)[:3]
-                pack2 = struct.pack("<i", 0)[:2]
-                key = self._encrypt_key + pack1 + pack2
-                assert len(key) == (len(self._encrypt_key) + 5)
-                md5_hash = hashlib.md5(key).digest()
-                key = md5_hash[: min(16, len(self._encrypt_key) + 5)]
+            if getattr(self, "_encryption", None) is not None:
+                obj = self._encryption.encrypt_object(obj, idnum, 0)
             obj.write_to_stream(stream)
             stream.write(b_("\nendobj\n"))
 

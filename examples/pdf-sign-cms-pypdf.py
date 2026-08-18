@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.serialization import pkcs12
 from endesive import signer
 from pypdf import PdfReader, PdfWriter
 from pypdf import generic as po
+from pypdf._encryption import AlgV4, Encryption, CryptRC4, CryptFilter
 
 
 def b_(s):
@@ -41,7 +42,20 @@ class WNumberObject(po.NumberObject):
         stream.write(self.Format % self)
 
 
-class Main(pdf.PdfFileWriter):
+def _prev_uses_xref_stream(prev):
+    stream = prev.stream
+    saved_pos = stream.tell()
+    try:
+        stream.seek(prev._startxref, 0)
+        x = stream.read(1)
+        if x in b"\r\n":
+            x = stream.read(1)
+        return x.isdigit()
+    finally:
+        stream.seek(saved_pos, 0)
+
+
+class Main(PdfWriter):
     annottext = True
     annotbutton = True
 
@@ -49,18 +63,20 @@ class Main(pdf.PdfFileWriter):
         encrypt = prev.trailer["/Encrypt"].get_object()
         if encrypt["/V"] == 2:
             rev = 3
-            keylen = int(128 / 8)
+            keybits = 128
         else:
             rev = 2
-            keylen = int(40 / 8)
-        P = encrypt["/P"]
-        O = encrypt["/O"]
-        ID_1 = prev.trailer["/ID"][0]
-        if rev == 2:
-            U, key = pdf._alg34(password, O, P, ID_1)
-        else:
-            assert rev == 3
-            U, key = pdf._alg35(password, rev, keylen, O, P, ID_1, False)
+            keybits = 40
+        P = encrypt["/P"].get_object()
+        O = encrypt["/O"].get_object().original_bytes
+        ID_1 = prev.trailer["/ID"].get_object()[0].original_bytes
+        metadata_encrypted = bool(
+            encrypt.get("/EncryptMetadata", po.BooleanObject(False)).get_object()
+        )
+        pwd = Encryption._encode_password(password)
+        key = AlgV4.compute_key(
+            pwd, rev, keybits, O, P & 0xFFFFFFFF, ID_1, metadata_encrypted
+        )
         self._encrypt_key = key
 
     def write(self, stream, prev, startdata):
@@ -74,19 +90,21 @@ class Main(pdf.PdfFileWriter):
                 continue
             positions[idnum] = startdata + stream.tell()
             stream.write(b_(str(idnum) + " 0 obj\n"))
-            key = None
             if self._encrypt_key is not None:
                 pack1 = struct.pack("<i", i + 1)[:3]
                 pack2 = struct.pack("<i", 0)[:2]
                 key = self._encrypt_key + pack1 + pack2
                 assert len(key) == (len(self._encrypt_key) + 5)
                 md5_hash = hashlib.md5(key).digest()
-                key = md5_hash[: min(16, len(self._encrypt_key) + 5)]
+                rc4_key = md5_hash[: min(16, len(self._encrypt_key) + 5)]
+                rc4 = CryptRC4(rc4_key)
+                obj = CryptFilter(rc4, rc4, rc4).encrypt_object(obj)
             obj.write_to_stream(stream)
             stream.write(b_("\nendobj\n"))
 
         xref_location = startdata + stream.tell()
-        if not prev.xrefstream:
+        xrefstream = _prev_uses_xref_stream(prev)
+        if not xrefstream:
             trailer = po.DictionaryObject()
         else:
             trailer = po.StreamObject()
@@ -103,7 +121,7 @@ class Main(pdf.PdfFileWriter):
         )
         if prev.is_encrypted:
             trailer[po.NameObject("/Encrypt")] = prev.trailer.raw_get("/Encrypt")
-        if not prev.xrefstream:
+        if not xrefstream:
             stream.write(b_("xref\n"))
             stream.write(b_("0 1\n"))
             stream.write(b_("0000000000 65535 f \n"))
